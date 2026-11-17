@@ -8,12 +8,13 @@
 #include <time.h>
 #include <fcntl.h>
 #include <string.h>
+#include <mqueue.h>
 #include "customs.h"
 
 // Структура для передачі даних через FIFO (Паспортний інспектор -> Інспектор багажу)
 struct passport_check_result {
     int passport_num;
-    int is_allowed; // 1 - проїзд дозволено, 0 - заборонено
+    int is_allowed;
 };
 
 // Глобальні змінні для відстеження сигналів готовності від дітей
@@ -40,10 +41,25 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    // Створюємо іменований канал (FIFO), якщо він ще не існує
-    unlink(FIFO_NAME); // Видаляємо старий, якщо лишився
+    // Створюємо іменований канал (FIFO)
+    unlink(FIFO_NAME);
     if (mkfifo(FIFO_NAME, 0666) == -1) {
         perror("Помилка створення mkfifo");
+        exit(EXIT_FAILURE);
+    }
+
+    // Налаштування POSIX черги повідомлень (Message Queue)
+    mq_unlink(QUEUE_NAME); // Видаляємо стару чергу, якщо лишилась
+    struct mq_attr attr;
+    attr.mq_flags = 0;
+    attr.mq_maxmsg = 10;
+    attr.mq_msgsize = sizeof(struct customs_msg);
+    attr.mq_curmsgs = 0;
+
+    mqd_t mq = mq_open(QUEUE_NAME, O_CREAT | O_RDWR, 0644, &attr);
+    if (mq == (mqd_t)-1) {
+        perror("Помилка створення message queue");
+        unlink(FIFO_NAME);
         exit(EXIT_FAILURE);
     }
 
@@ -63,6 +79,9 @@ int main(int argc, char *argv[]) {
     int pipe_fd[2];
     if (pipe(pipe_fd) == -1) {
         perror("Помилка створення pipe");
+        mq_close(mq);
+        mq_unlink(QUEUE_NAME);
+        unlink(FIFO_NAME);
         exit(EXIT_FAILURE);
     }
 
@@ -74,10 +93,9 @@ int main(int argc, char *argv[]) {
         perror("Помилка fork для інспектора 1");
         exit(EXIT_FAILURE);
     } else if (pid1 == 0) {
-        close(pipe_fd[1]); // Закриваємо запис у pipe
+        close(pipe_fd[1]);
         srand(time(NULL) ^ getpid());
 
-        // Відкриваємо FIFO на запис
         int fifo_fd = open(FIFO_NAME, O_WRONLY);
         if (fifo_fd == -1) {
             perror("Помилка відкриття FIFO на запис");
@@ -100,7 +118,6 @@ int main(int argc, char *argv[]) {
                 printf("[Паспортний інспектор] Паспорт №%d: ПРОЇЗД ЗАБОРОНЕНО\n", passport_num);
             }
 
-            // Передаємо результат через іменований канал (FIFO) другому інспектору
             write(fifo_fd, &res, sizeof(struct passport_check_result));
             usleep(100000);
         }
@@ -120,10 +137,17 @@ int main(int argc, char *argv[]) {
         close(pipe_fd[1]);
         srand(time(NULL) ^ (getpid() + 1));
 
-        // Відкриваємо FIFO на читання
         int fifo_fd = open(FIFO_NAME, O_RDONLY);
         if (fifo_fd == -1) {
             perror("Помилка відкриття FIFO на читання");
+            exit(EXIT_FAILURE);
+        }
+
+        // Відкриваємо чергу повідомлень на запис
+        mqd_t mq_child = mq_open(QUEUE_NAME, O_WRONLY);
+        if (mq_child == (mqd_t)-1) {
+            perror("Помилка відкриття message queue дитиною");
+            close(fifo_fd);
             exit(EXIT_FAILURE);
         }
 
@@ -131,23 +155,31 @@ int main(int argc, char *argv[]) {
         kill(getppid(), SIGUSR2);
 
         struct passport_check_result res;
-        // Читаємо з FIFO все, що передав паспортний інспектор
         while (read(fifo_fd, &res, sizeof(struct passport_check_result)) > 0) {
+            struct customs_msg msg;
+            msg.passport_num = res.passport_num;
+            msg.is_allowed = res.is_allowed;
+
             if (res.is_allowed) {
-                // Якщо проїзд дозволено — генеруємо бали митного контролю від 1 до 6
-                int baggage_score = 1 + rand() % 6;
-                printf("[Інспектор багажу] Паспорт №%d пройшов паспортний контроль. Огляд багажу: %d балів\n", 
-                       res.passport_num, baggage_score);
-                
-                // Згодом тут додадим відправку в чергу повідомлень (Message Queue) для Начальника
+                msg.baggage_score = 1 + rand() % 6;
+                printf("[Інспектор багажу] Паспорт №%d пройшов контроль. Багаж: %d балів\n", 
+                       res.passport_num, msg.baggage_score);
             } else {
-                printf("[Інспектор багажу] Паспорт №%d затримано на паспортному контролі (багаж не оглядається).\n", 
+                msg.baggage_score = 0;
+                printf("[Інспектор багажу] Паспорт №%d затримано. Багаж не оглядається.\n", 
                        res.passport_num);
             }
+
+            // Відправляємо результат у чергу повідомлень для Начальника
+            if (mq_send(mq_child, (char *)&msg, sizeof(struct customs_msg), 0) == -1) {
+                perror("Помилка mq_send");
+            }
+
             usleep(100000);
         }
 
         close(fifo_fd);
+        mq_close(mq_child);
         exit(EXIT_SUCCESS);
     }
 
@@ -175,9 +207,27 @@ int main(int argc, char *argv[]) {
     waitpid(pid1, NULL, 0);
     waitpid(pid2, NULL, 0);
 
-    // Видаляємо іменований канал після завершення роботи
+    // Начальник зчитує результати з черги повідомлень
+    printf("\n--- [Начальник] ОФІЦІЙНИЙ ЗВІТ З ЧЕРГИ ПОВІДОМЛЕНЬ (MESSAGE QUEUE) ---\n");
+    for (int i = 0; i < travelers_count; i++) {
+        struct customs_msg msg;
+        if (mq_receive(mq, (char *)&msg, sizeof(struct customs_msg), NULL) != -1) {
+            if (msg.is_allowed) {
+                printf("[Звіт Начальника] Мандрівник №%d: Проїзд ДОЗВОЛЕНО | Митний бал: %d/6\n", 
+                       msg.passport_num, msg.baggage_score);
+            } else {
+                printf("[Звіт Начальника] Мандрівник №%d: Проїзд ЗАБОРОНЕНО | Затримано\n", 
+                       msg.passport_num);
+            }
+        }
+    }
+    printf("--------------------------------------------------------------------\n");
+
+    // Очищення IPC ресурсів
+    mq_close(mq);
+    mq_unlink(QUEUE_NAME);
     unlink(FIFO_NAME);
 
-    printf("[Начальник] Робота пункту пропуску завершена.\n");
+    printf("[Начальник] Робота пункту пропуску успішно завершена.\n");
     return 0;
 }
