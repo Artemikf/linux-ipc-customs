@@ -2,10 +2,19 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <time.h>
+#include <fcntl.h>
+#include <string.h>
 #include "customs.h"
+
+// Структура для передачі даних через FIFO (Паспортний інспектор -> Інспектор багажу)
+struct passport_check_result {
+    int passport_num;
+    int is_allowed; // 1 - проїзд дозволено, 0 - заборонено
+};
 
 // Глобальні змінні для відстеження сигналів готовності від дітей
 volatile sig_atomic_t inspector1_ready = 0;
@@ -31,7 +40,14 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    // Налаштування обробників сигналів від дочірніх процесів
+    // Створюємо іменований канал (FIFO), якщо він ще не існує
+    unlink(FIFO_NAME); // Видаляємо старий, якщо лишився
+    if (mkfifo(FIFO_NAME, 0666) == -1) {
+        perror("Помилка створення mkfifo");
+        exit(EXIT_FAILURE);
+    }
+
+    // Налаштування обробників сигналів
     struct sigaction sa1, sa2;
     sa1.sa_handler = handle_sigusr1;
     sigemptyset(&sa1.sa_mask);
@@ -52,72 +68,115 @@ int main(int argc, char *argv[]) {
 
     pid_t pid1, pid2;
 
-    // Створення 1-го дочірнього процесу (Паспортний інспектор)
+    // --- 1-й ДОЧІРНІЙ ПРОЦЕС (Паспортний інспектор) ---
     pid1 = fork();
     if (pid1 < 0) {
         perror("Помилка fork для інспектора 1");
         exit(EXIT_FAILURE);
     } else if (pid1 == 0) {
-        // --- КОД 1-ГО ДОЧІРНЬОГО ПРОЦЕСУ (Паспортний інспектор) ---
-        // Закриваємо зайвий кінець пайпа на запис
-        close(pipe_fd[1]);
+        close(pipe_fd[1]); // Закриваємо запис у pipe
+        srand(time(NULL) ^ getpid());
+
+        // Відкриваємо FIFO на запис
+        int fifo_fd = open(FIFO_NAME, O_WRONLY);
+        if (fifo_fd == -1) {
+            perror("Помилка відкриття FIFO на запис");
+            exit(EXIT_FAILURE);
+        }
 
         // Сигналимо батькові про готовність
         kill(getppid(), SIGUSR1);
 
-        // Тут напарник напише логіку читання з pipe_fd[0] та роботи з FIFO
-        // Наразі просто симулюємо очікування
+        int passport_num;
+        while (read(pipe_fd[0], &passport_num, sizeof(int)) > 0) {
+            int r = rand() % 100;
+            struct passport_check_result res;
+            res.passport_num = passport_num;
+            res.is_allowed = (r >= 20); // 80% дозволено, 20% заборонено
+
+            if (res.is_allowed) {
+                printf("[Паспортний інспектор] Паспорт №%d: ПРОЇЗД ДОЗВОЛЕНО\n", passport_num);
+            } else {
+                printf("[Паспортний інспектор] Паспорт №%d: ПРОЇЗД ЗАБОРОНЕНО\n", passport_num);
+            }
+
+            // Передаємо результат через іменований канал (FIFO) другому інспектору
+            write(fifo_fd, &res, sizeof(struct passport_check_result));
+            usleep(100000);
+        }
+
+        close(pipe_fd[0]);
+        close(fifo_fd);
         exit(EXIT_SUCCESS);
     }
 
-    // Створення 2-го дочірнього процесу (Інспектор багажу / Семафори)
+    // --- 2-й ДОЧІРНІЙ ПРОЦЕС (Інспектор багажу) ---
     pid2 = fork();
     if (pid2 < 0) {
         perror("Помилка fork для інспектора 2");
         exit(EXIT_FAILURE);
     } else if (pid2 == 0) {
-        // --- КОД 2-ГО ДОЧІРНЬОГО ПРОЦЕСУ (Інспектор багажу) ---
-        // Закриваємо весь pipe, бо він тут не потрібен
         close(pipe_fd[0]);
         close(pipe_fd[1]);
+        srand(time(NULL) ^ (getpid() + 1));
+
+        // Відкриваємо FIFO на читання
+        int fifo_fd = open(FIFO_NAME, O_RDONLY);
+        if (fifo_fd == -1) {
+            perror("Помилка відкриття FIFO на читання");
+            exit(EXIT_FAILURE);
+        }
 
         // Сигналимо батькові про готовність
         kill(getppid(), SIGUSR2);
 
-        // Тут напарник напише логіку FIFO, митного огляду, семафорів та логування
+        struct passport_check_result res;
+        // Читаємо з FIFO все, що передав паспортний інспектор
+        while (read(fifo_fd, &res, sizeof(struct passport_check_result)) > 0) {
+            if (res.is_allowed) {
+                // Якщо проїзд дозволено — генеруємо бали митного контролю від 1 до 6
+                int baggage_score = 1 + rand() % 6;
+                printf("[Інспектор багажу] Паспорт №%d пройшов паспортний контроль. Огляд багажу: %d балів\n", 
+                       res.passport_num, baggage_score);
+                
+                // Згодом тут додадим відправку в чергу повідомлень (Message Queue) для Начальника
+            } else {
+                printf("[Інспектор багажу] Паспорт №%d затримано на паспортному контролі (багаж не оглядається).\n", 
+                       res.passport_num);
+            }
+            usleep(100000);
+        }
+
+        close(fifo_fd);
         exit(EXIT_SUCCESS);
     }
 
-    // --- КОД БАТЬКІВСЬКОГО ПРОЦЕСУ (Начальник зміни) ---
-    // Закриваємо кінець пайпа на читання (начальник тільки пише в нього)
+    // --- БАТЬКІВСЬКИЙ ПРОЦЕС (Начальник зміни) ---
     close(pipe_fd[0]);
 
     printf("[Начальник] Очікування готовності інспекторів...\n");
-    // Чекаємо, поки обидва інспектори надішлють сигнали готовності
     while (!inspector1_ready || !inspector2_ready) {
         pause();
     }
     printf("[Начальник] Обидва інспектори готові до роботи!\n");
 
-    // Генерація випадкових номерів паспортів та запис у pipe
     srand(time(NULL));
     printf("[Начальник] Генерація та відправка %d мандрівників у pipe...\n", travelers_count);
 
     for (int i = 0; i < travelers_count; i++) {
-        int passport_num = 100000 + rand() % 900000; // 6-значний номер паспорта
+        int passport_num = 100000 + rand() % 900000;
         write(pipe_fd[1], &passport_num, sizeof(int));
-        printf("[Начальник] Згенеровано паспорт: %d\n", passport_num);
-        usleep(100000); // невелика пауза для наочності (0.1с)
+        usleep(100000);
     }
 
-    // Закриваємо записуючий кінець пайпа, щоб діти знали, що дані скінчилися
     close(pipe_fd[1]);
 
     // Очікування завершення дочірніх процесів
     waitpid(pid1, NULL, 0);
     waitpid(pid2, NULL, 0);
 
-    // Згодом сюди додадим зчитування з черги повідомлень (Message Queue)
+    // Видаляємо іменований канал після завершення роботи
+    unlink(FIFO_NAME);
 
     printf("[Начальник] Робота пункту пропуску завершена.\n");
     return 0;
